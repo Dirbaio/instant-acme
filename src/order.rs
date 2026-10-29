@@ -98,6 +98,8 @@ impl Order {
             .await?;
 
         self.nonce = nonce_from_response(&rsp);
+        // torii fork: keep the Retry-After, for `poll_certificate()`'s first wait.
+        self.retry_after = retry_after(&rsp);
         self.state = Problem::check::<OrderState>(rsp).await?;
         Ok(())
     }
@@ -165,7 +167,9 @@ impl Order {
     /// [`Error::Timeout`] if the [`RetryPolicy::timeout`] has been reached.
     pub async fn poll_ready(&mut self, retries: &RetryPolicy) -> Result<OrderStatus, Error> {
         let mut retrying = retries.state();
-        self.retry_after = None;
+        // torii fork: the first wait honours the Retry-After of the last response for this
+        // order (a refresh, the finalization, or the fetch in `Account::order()`), which
+        // upstream cleared here.
         loop {
             if let ControlFlow::Break(err) = retrying.wait(self.retry_after.take()).await {
                 return Err(err);
@@ -188,7 +192,8 @@ impl Order {
     /// into a timeout, or if the ACME CA suggest to retry at a later time.
     pub async fn poll_certificate(&mut self, retries: &RetryPolicy) -> Result<String, Error> {
         let mut retrying = retries.state();
-        self.retry_after = None;
+        // torii fork: the first wait honours the Retry-After of the last response for this
+        // order: that of the finalization, which says when to poll first (RFC 8555 §7.4).
         loop {
             if let ControlFlow::Break(err) = retrying.wait(self.retry_after.take()).await {
                 return Err(err);

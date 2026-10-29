@@ -14,7 +14,8 @@ use std::pin::Pin;
 use std::process::{Child, Command};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use std::{env, fs};
 
 use base64::Engine;
@@ -174,6 +175,86 @@ impl<C: HttpClient> HttpClient for RateLimitedClient<C> {
             response.body = Box::new(Bytes::from_static(
                 br#"{"type":"urn:ietf:params:acme:error:rateLimited","status":429}"#,
             ));
+            Ok(response)
+        })
+    }
+}
+
+// torii fork: Pebble answers a finalization with its order Retry-After, and
+// `poll_certificate()` does not poll the order before then.
+#[tokio::test]
+#[ignore]
+async fn finalize_retry_after() -> Result<(), Box<dyn StdError>> {
+    try_tracing_init();
+
+    let retry_after = Duration::from_secs(3);
+    let mut config = EnvironmentConfig::default();
+    config.pebble.retry_after = RetryConfig {
+        authz: Duration::ZERO,
+        order: retry_after,
+    };
+    let mut env = Environment::new(config).await?;
+    let client = FinalizeTimingClient {
+        inner: env.client.clone(),
+        finalized: Arc::default(),
+        first_poll: Arc::default(),
+    };
+    let (account, _) = Account::builder(Box::new(client.clone()), test_provider())?
+        .create(
+            &NewAccount {
+                contact: &[],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            format!("https://{}/dir", env.config.pebble.listen_address),
+            None,
+        )
+        .await?;
+    env.account = account;
+    env.test::<Http01>(&NewOrder::new(&dns_identifiers([
+        "finalize-retry-after.example.com",
+    ])))
+    .await?;
+
+    let finalized = client.finalized.lock().unwrap().expect("no finalization");
+    let first_poll = client
+        .first_poll
+        .lock()
+        .unwrap()
+        .expect("no poll after finalization");
+    // HTTP dates have one-second precision.
+    assert!(first_poll - finalized >= retry_after - Duration::from_secs(1));
+
+    Ok(())
+}
+
+// Records when the order was finalized, and when it was first polled after that.
+#[derive(Clone)]
+struct FinalizeTimingClient<C> {
+    inner: C,
+    finalized: Arc<Mutex<Option<Instant>>>,
+    first_poll: Arc<Mutex<Option<Instant>>>,
+}
+
+impl<C: HttpClient> HttpClient for FinalizeTimingClient<C> {
+    fn request(
+        &self,
+        req: Request<BodyWrapper<Bytes>>,
+    ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, Error>> + Send>> {
+        let path = req.uri().path().to_owned();
+        if path.starts_with("/my-order/") && self.finalized.lock().unwrap().is_some() {
+            self.first_poll
+                .lock()
+                .unwrap()
+                .get_or_insert_with(Instant::now);
+        }
+        let response = self.inner.request(req);
+        let finalized = self.finalized.clone();
+        Box::pin(async move {
+            let response = response.await?;
+            if path.starts_with("/finalize-order/") {
+                *finalized.lock().unwrap() = Some(Instant::now());
+            }
             Ok(response)
         })
     }
